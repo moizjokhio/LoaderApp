@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Excel files (test outputs)
+*.xlsx
+*.xls
+!sample_employees.xlsx
+!sample_education.xlsx
+
+# Test files
+test_*.py
+demo_*.py
+verify_*.py
+list_models.py
+create_samples.py
+
+# Document samples
+document_samples/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.bak
+*~
