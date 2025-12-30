@@ -11,6 +11,7 @@ from io import BytesIO
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from PIL import Image
+import time
 
 # System prompt with all business logic rules
 SYSTEM_PROMPT = """
@@ -169,25 +170,52 @@ Please analyze this image. It may contain ONE or MULTIPLE Pakistani educational 
 
 Return ONLY valid JSON with no markdown formatting."""
     
-    # Create the API request with Gemini
-    response = model.generate_content(
-        [prompt, img],
-        generation_config=genai.GenerationConfig(
-            response_mime_type="application/json",
-            temperature=0.1
-        )
-    )
+    # Retry logic for rate limiting
+    max_retries = 3
+    retry_delay = 2  # Start with 2 seconds
     
-    # Parse the JSON response
-    response_text = response.text
-    parsed_response = json.loads(response_text)
-    
-    # Handle both new format (with documents array) and legacy format (single object)
-    if "documents" in parsed_response:
-        return parsed_response["documents"]
-    else:
-        # Legacy format - wrap in array for consistency
-        return [parsed_response]
+    for attempt in range(max_retries):
+        try:
+            # Create the API request with Gemini
+            response = model.generate_content(
+                [prompt, img],
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
+            )
+            
+            # Parse the JSON response
+            response_text = response.text
+            parsed_response = json.loads(response_text)
+            
+            # Handle both new format (with documents array) and legacy format (single object)
+            if "documents" in parsed_response:
+                return parsed_response["documents"]
+            else:
+                # Legacy format - wrap in array for consistency
+                return [parsed_response]
+                
+        except Exception as e:
+            error_msg = str(e)
+            # Check if it's a rate limit error
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                if attempt < max_retries - 1:
+                    # Extract retry delay from error message if available
+                    if "retry in" in error_msg.lower():
+                        try:
+                            import re
+                            match = re.search(r'retry in ([0-9.]+)s', error_msg)
+                            if match:
+                                retry_delay = float(match.group(1)) + 1  # Add 1 second buffer
+                        except:
+                            pass
+                    
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+            # If not a rate limit error or final attempt, raise the error
+            raise
 
 
 def convert_df_to_excel(df: pd.DataFrame) -> bytes:
@@ -370,10 +398,18 @@ def main():
                     if len(documents) > 1:
                         st.info(f"ℹ️ {file.name}: Found {len(documents)} documents in this file")
                     
+                    # Add small delay between requests to avoid rate limits (1.5 seconds)
+                    if idx < len(uploaded_files) - 1:  # Don't delay after last file
+                        time.sleep(1.5)
+                    
                 except json.JSONDecodeError as e:
                     st.error(f"❌ Failed to parse response for {file.name}: {str(e)}")
                 except Exception as e:
-                    st.error(f"❌ Error processing {file.name}: {str(e)}")
+                    error_msg = str(e)
+                    if "429" in error_msg or "quota" in error_msg.lower():
+                        st.error(f"⚠️ Rate limit reached at {file.name}. Please wait a minute and try remaining files.")
+                    else:
+                        st.error(f"❌ Error processing {file.name}: {str(e)}")
                 
                 # Update progress
                 progress_bar.progress((idx + 1) / len(uploaded_files))
