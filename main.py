@@ -515,20 +515,20 @@ RETURN ONLY THE JSON OBJECT NOTHING ELSE."""
 
 
 def cv_experience_parser_page():
-    """CV/Experience Parser Page - Extract data from CVs and Experience Letters."""
-    st.markdown('<div class="main-header">👔 CV/Experience Parser</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Extract complete profile data from CVs, Resumes & Experience Letters</div>', unsafe_allow_html=True)
+    """CV/Experience Parser Page - Extract EXPERIENCE data from merged candidate documents."""
+    st.markdown('<div class="main-header">👔 Experience Parser</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Extract experience from CIF, Resume/CV & Experience Letters</div>', unsafe_allow_html=True)
     
     st.markdown("---")
-    st.info("📋 Upload multi-page CV/Resume PDFs. This tool extracts: Personal Info, Education, Work Experience, Skills & More!")
+    st.info("📋 Upload merged candidate documents (multi-page PDFs). Extracts experience from: **Candidate Information Form**, **Resume/CV**, and **Experience Letters**")
     
     # File uploader
-    st.markdown("### 📤 Upload CV/Resume Documents")
+    st.markdown("### 📤 Upload Candidate Documents")
     uploaded_cv_files = st.file_uploader(
-        "Upload CV/Resume PDFs (multi-page supported)",
+        "Upload merged candidate PDFs (contains CIF + CV + Experience Letters)",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Upload complete CV/Resume PDFs. The system will extract all pages.",
+        help="Upload complete merged candidate documents. System extracts experience from all sections.",
         key="cv_uploader"
     )
     
