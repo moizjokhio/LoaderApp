@@ -406,25 +406,35 @@ def process_cv_multipage(client, pdf_file) -> dict:
     pdf_bytes = pdf_file.getvalue()
     pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    # Extract text from all pages
-    full_text = ""
-    for page_num in range(len(pdf_document)):
+    # Extract text from ALL pages with clear markers
+    total_pages = len(pdf_document)
+    full_text = f"TOTAL PAGES: {total_pages}\n\n"
+    
+    for page_num in range(total_pages):
         page = pdf_document[page_num]
-        full_text += f"\n\n========== PAGE {page_num + 1} ==========\n\n"
-        full_text += page.get_text()
+        page_text = page.get_text()
+        full_text += f"\n{'='*80}\nPAGE {page_num + 1}/{total_pages}\n{'='*80}\n"
+        full_text += page_text
     
     pdf_document.close()
     
     # Create focused prompt for EXPERIENCE extraction
-    prompt = f"""You are an HR expert. Extract ALL experience/work history information from this document.
+    # Use more text to ensure we capture all pages (increased from 15000 to 50000 characters)
+    prompt = f"""You are an HR expert. Extract ALL experience/work history information from this MULTI-PAGE document.
 
-This is a merged candidate document that may contain:
-1. Candidate Information Form (CIF) with "Professional Information" section
-2. Resume/CV with "Experience" or "Work History" section  
-3. Experience Letters from previous employers
+IMPORTANT INSTRUCTIONS:
+- This is a MERGED candidate document with {total_pages} pages
+- You MUST search through ALL pages thoroughly
+- Look for these EXACT keywords: "EXPERIENCE CERTIFICATE", "EXPERIENCE LETTER", "Experience", "Employment History", "Professional Information"
+- Check EVERY page - experience letters are often at the END of the document
 
-DOCUMENT TEXT:
-{full_text[:15000]}
+This document may contain:
+1. Candidate Information Form (CIF) - has "Professional Information" section
+2. Resume/CV - has "Experience" or "Work History" section  
+3. Experience Letters/Certificates - separate pages with company letterheads
+
+FULL DOCUMENT TEXT (ALL {total_pages} PAGES):
+{full_text[:50000]}
 
 Return ONLY a valid JSON object (no markdown, no explanations):
 
@@ -463,12 +473,20 @@ Return ONLY a valid JSON object (no markdown, no explanations):
 
 CRITICAL RULES:
 1. found = true ONLY if actual work experience is mentioned (not courses/internships unless paid professional internships)
-2. Extract from ALL sources found in the document
-3. If dates only show month/year, use 01/MM/YYYY format
-4. Calculate duration_months = (leaving_date - joining_date) in months
-5. Mark source clearly: "CIF", "Resume", or "Experience Letter"
-6. Return ONLY valid JSON - no text before or after
-7. If experience section exists but is empty/not filled, found = false
+2. Search ALL {total_pages} pages - experience letters are usually on SEPARATE pages near the end
+3. Look for keywords: "EXPERIENCE CERTIFICATE", "EXPERIENCE LETTER", "Employment", "worked as", "Manager", "Officer"
+4. If you find a page with company letterhead + candidate name + dates + designation, that's an experience letter
+5. Extract from ALL sources found in the document
+6. If dates only show month/year, use 01/MM/YYYY format
+7. Calculate duration_months = (leaving_date - joining_date) in months
+8. Mark source clearly: "CIF", "Resume", or "Experience Letter"
+9. Return ONLY valid JSON - no text before or after
+10. If experience section exists but is empty/not filled, found = false
+
+SEARCH STRATEGY:
+- First 1-3 pages: Usually CIF form
+- Middle pages: Usually Resume/CV
+- Last pages: Usually Experience Letters/Certificates
 
 RETURN ONLY THE JSON OBJECT NOTHING ELSE."""
 
@@ -479,7 +497,7 @@ RETURN ONLY THE JSON OBJECT NOTHING ELSE."""
                 model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.05,
-                max_tokens=4000
+                max_tokens=6000  # Increased to handle more detailed extraction
             )
             
             # Extract JSON from response
