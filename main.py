@@ -390,10 +390,75 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def classify_page_type(page_text: str) -> str:
+    """
+    Classify a page as CIF, Resume, Experience Letter, or Other.
+    Uses keyword matching for fast classification.
+    """
+    text_lower = page_text.lower()
+    
+    # CIF keywords
+    cif_keywords = [
+        'candidate information form',
+        'professional information',
+        'present employer',
+        'employment status',
+        'basic pay scale',
+        'date of joining present post'
+    ]
+    
+    # Resume keywords
+    resume_keywords = [
+        'summary',
+        'objective',
+        'skills',
+        'work experience',
+        'employment history',
+        'projects',
+        'certifications'
+    ]
+    
+    # Experience Letter keywords
+    exp_letter_keywords = [
+        'experience certificate',
+        'experience letter',
+        'to whom it may concern',
+        'this is to certify',
+        'worked as',
+        'designation',
+        'has been working',
+        'stamp and signature'
+    ]
+    
+    # Count matches
+    cif_score = sum(1 for kw in cif_keywords if kw in text_lower)
+    resume_score = sum(1 for kw in resume_keywords if kw in text_lower)
+    exp_letter_score = sum(1 for kw in exp_letter_keywords if kw in text_lower)
+    
+    # Classify based on highest score
+    max_score = max(cif_score, resume_score, exp_letter_score)
+    
+    if max_score == 0:
+        return "Other"
+    elif cif_score == max_score:
+        return "CIF"
+    elif exp_letter_score == max_score:
+        return "Experience Letter"
+    elif resume_score == max_score:
+        return "Resume"
+    else:
+        return "Other"
+
+
 def process_cv_multipage(client, pdf_file) -> dict:
     """
-    Process multi-page CV/Resume PDF and extract EXPERIENCE information.
-    Looks for experience in: CIF Professional Information, Resume/CV, Experience Letters
+    SMART APPROACH: Process multi-page CV/Resume PDF with page classification.
+    
+    Strategy:
+    1. Classify each page by type (CIF, Resume, Experience Letter, Other)
+    2. Group pages by type
+    3. Extract experience from each group with targeted prompts
+    4. Merge results
     
     Args:
         client: Groq client instance
@@ -402,134 +467,229 @@ def process_cv_multipage(client, pdf_file) -> dict:
     Returns:
         Dictionary with extracted data
     """
-    # Open PDF and extract text from all pages
+    # Open PDF and extract pages
     pdf_bytes = pdf_file.getvalue()
     pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    # Extract text from ALL pages with clear markers
-    total_pages = len(pdf_document)
-    full_text = f"TOTAL PAGES: {total_pages}\n\n"
-    
-    for page_num in range(total_pages):
+    # Step 1: Extract and classify each page
+    pages_data = []
+    for page_num in range(len(pdf_document)):
         page = pdf_document[page_num]
         page_text = page.get_text()
-        full_text += f"\n{'='*80}\nPAGE {page_num + 1}/{total_pages}\n{'='*80}\n"
-        full_text += page_text
+        page_type = classify_page_type(page_text)
+        
+        pages_data.append({
+            'page_num': page_num + 1,
+            'text': page_text,
+            'type': page_type
+        })
     
     pdf_document.close()
     
-    # Create focused prompt for EXPERIENCE extraction
-    # Use more text to ensure we capture all pages (increased from 15000 to 50000 characters)
-    prompt = f"""You are an HR expert. Extract ALL experience/work history information from this MULTI-PAGE document.
+    # Step 2: Group pages by type
+    cif_pages = [p for p in pages_data if p['type'] == 'CIF']
+    resume_pages = [p for p in pages_data if p['type'] == 'Resume']
+    exp_letter_pages = [p for p in pages_data if p['type'] == 'Experience Letter']
+    
+    # Step 2: Group pages by type
+    cif_pages = [p for p in pages_data if p['type'] == 'CIF']
+    resume_pages = [p for p in pages_data if p['type'] == 'Resume']
+    exp_letter_pages = [p for p in pages_data if p['type'] == 'Experience Letter']
+    
+    # Step 3: Extract personal info from first few pages
+    personal_info = {}
+    first_pages_text = '\n\n'.join([p['text'] for p in pages_data[:3]])
+    
+    try:
+        personal_prompt = f"""Extract personal information from this document:
 
-IMPORTANT INSTRUCTIONS:
-- This is a MERGED candidate document with {total_pages} pages
-- You MUST search through ALL pages thoroughly
-- Look for these EXACT keywords: "EXPERIENCE CERTIFICATE", "EXPERIENCE LETTER", "Experience", "Employment History", "Professional Information"
-- Check EVERY page - experience letters are often at the END of the document
+{first_pages_text[:3000]}
 
-This document may contain:
-1. Candidate Information Form (CIF) - has "Professional Information" section
-2. Resume/CV - has "Experience" or "Work History" section  
-3. Experience Letters/Certificates - separate pages with company letterheads
-
-FULL DOCUMENT TEXT (ALL {total_pages} PAGES):
-{full_text[:50000]}
-
-Return ONLY a valid JSON object (no markdown, no explanations):
-
+Return ONLY valid JSON:
 {{
-  "personal_info": {{
-    "full_name": "Extract full name",
-    "cnic": "Extract CNIC (format: 00000-0000000-0)",
-    "email": "Extract email",
-    "contact": "Extract phone number"
-  }},
-  "experience_in_cif": {{
-    "found": true/false,
-    "details": "If found in Professional Information section of CIF, write brief summary. Otherwise empty string"
-  }},
-  "experience_in_resume": {{
-    "found": true/false,
-    "details": "If found in Resume/CV Experience section, write brief summary. Otherwise empty string"
-  }},
-  "experience_letter_found": {{
-    "found": true/false,
-    "details": "If experience certificate/letter found, write issuing company. Otherwise empty string"
-  }},
-  "all_experiences": [
+  "full_name": "Extract candidate name",
+  "cnic": "Extract CNIC (format: 00000-0000000-0)",
+  "email": "Extract email address",
+  "contact": "Extract phone number"
+}}"""
+
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": personal_prompt}],
+            temperature=0.05,
+            max_tokens=500
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        if start != -1 and end > start:
+            personal_info = json.loads(response_text[start:end])
+    except:
+        personal_info = {"full_name": "Unknown", "cnic": "", "email": "", "contact": ""}
+    
+    # Step 4: Extract experience from CIF pages
+    cif_experience = {"found": False, "details": ""}
+    all_experiences = []
+    
+    if cif_pages:
+        cif_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in cif_pages])
+        
+        cif_prompt = f"""Extract work experience from this CIF Professional Information section:
+
+{cif_text[:5000]}
+
+Return ONLY valid JSON:
+{{
+  "found": true/false,
+  "details": "Brief summary if found",
+  "experiences": [
     {{
-      "source": "CIF" or "Resume" or "Experience Letter",
       "employer": "Company name",
       "designation": "Job title",
-      "date_joining": "DD/MM/YYYY or MM/YYYY",
-      "date_leaving": "DD/MM/YYYY or MM/YYYY or Present",
-      "duration_months": "Calculate total months worked",
-      "monthly_salary": "Extract if mentioned, otherwise empty",
+      "date_joining": "DD/MM/YYYY",
+      "date_leaving": "DD/MM/YYYY or Present",
+      "duration_months": "Calculate months",
+      "monthly_salary": "Extract if mentioned",
       "responsibilities": "Brief summary"
     }}
   ]
 }}
 
-CRITICAL RULES:
-1. found = true ONLY if actual work experience is mentioned (not courses/internships unless paid professional internships)
-2. Search ALL {total_pages} pages - experience letters are usually on SEPARATE pages near the end
-3. Look for keywords: "EXPERIENCE CERTIFICATE", "EXPERIENCE LETTER", "Employment", "worked as", "Manager", "Officer"
-4. If you find a page with company letterhead + candidate name + dates + designation, that's an experience letter
-5. Extract from ALL sources found in the document
-6. If dates only show month/year, use 01/MM/YYYY format
-7. Calculate duration_months = (leaving_date - joining_date) in months
-8. Mark source clearly: "CIF", "Resume", or "Experience Letter"
-9. Return ONLY valid JSON - no text before or after
-10. If experience section exists but is empty/not filled, found = false
+found = true only if actual work experience exists (not empty fields)."""
 
-SEARCH STRATEGY:
-- First 1-3 pages: Usually CIF form
-- Middle pages: Usually Resume/CV
-- Last pages: Usually Experience Letters/Certificates
-
-RETURN ONLY THE JSON OBJECT NOTHING ELSE."""
-
-    max_retries = 3
-    for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
                 model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": cif_prompt}],
                 temperature=0.05,
-                max_tokens=6000  # Increased to handle more detailed extraction
+                max_tokens=2000
             )
             
-            # Extract JSON from response
             response_text = response.choices[0].message.content.strip()
-            
-            # Clean up response - remove markdown, extra text
-            # Find the JSON object
             start = response_text.find('{')
             end = response_text.rfind('}') + 1
-            
             if start != -1 and end > start:
-                response_text = response_text[start:end]
+                cif_data = json.loads(response_text[start:end])
+                cif_experience = {"found": cif_data.get("found", False), "details": cif_data.get("details", "")}
+                
+                # Add to all_experiences with source
+                for exp in cif_data.get("experiences", []):
+                    exp['source'] = 'CIF'
+                    all_experiences.append(exp)
+        except:
+            pass
+    
+    # Step 5: Extract experience from Resume pages
+    resume_experience = {"found": False, "details": ""}
+    
+    if resume_pages:
+        resume_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in resume_pages])
+        
+        resume_prompt = f"""Extract work experience from this Resume/CV:
+
+{resume_text[:8000]}
+
+Return ONLY valid JSON:
+{{
+  "found": true/false,
+  "details": "Brief summary if found",
+  "experiences": [
+    {{
+      "employer": "Company name",
+      "designation": "Job title",
+      "date_joining": "DD/MM/YYYY",
+      "date_leaving": "DD/MM/YYYY or Present",
+      "duration_months": "Calculate months",
+      "monthly_salary": "Extract if mentioned",
+      "responsibilities": "Brief summary"
+    }}
+  ]
+}}
+
+found = true only if actual work experience exists."""
+
+        try:
+            response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[{"role": "user", "content": resume_prompt}],
+                temperature=0.05,
+                max_tokens=3000
+            )
             
-            # Try to parse JSON
-            data = json.loads(response_text)
-            return data
+            response_text = response.choices[0].message.content.strip()
+            start = response_text.find('{')
+            end = response_text.rfind('}') + 1
+            if start != -1 and end > start:
+                resume_data = json.loads(response_text[start:end])
+                resume_experience = {"found": resume_data.get("found", False), "details": resume_data.get("details", "")}
+                
+                # Add to all_experiences with source
+                for exp in resume_data.get("experiences", []):
+                    exp['source'] = 'Resume'
+                    all_experiences.append(exp)
+        except:
+            pass
+    
+    # Step 6: Extract experience from Experience Letter pages
+    exp_letter_found = {"found": False, "details": ""}
+    
+    if exp_letter_pages:
+        exp_letter_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in exp_letter_pages])
+        
+        exp_letter_prompt = f"""Extract work experience from these Experience Certificates/Letters:
+
+{exp_letter_text[:8000]}
+
+Return ONLY valid JSON:
+{{
+  "found": true/false,
+  "details": "List company names issuing letters",
+  "experiences": [
+    {{
+      "employer": "Company name from letterhead",
+      "designation": "Job title mentioned",
+      "date_joining": "DD/MM/YYYY",
+      "date_leaving": "DD/MM/YYYY",
+      "duration_months": "Calculate months",
+      "monthly_salary": "Extract if mentioned",
+      "responsibilities": "Brief description from letter"
+    }}
+  ]
+}}
+
+found = true if experience certificate/letter exists."""
+
+        try:
+            response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[{"role": "user", "content": exp_letter_prompt}],
+                temperature=0.05,
+                max_tokens=3000
+            )
             
-        except json.JSONDecodeError as e:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-            else:
-                # Return empty structure if all retries fail
-                return {
-                    "personal_info": {"full_name": "Parse Error", "cnic": "", "email": "", "contact": ""},
-                    "experience_in_cif": {"found": False, "details": f"JSON Error: {str(e)}"},
-                    "experience_in_resume": {"found": False, "details": ""},
-                    "experience_letter_found": {"found": False, "details": ""},
-                    "all_experiences": []
-                }
-        except Exception as e:
-            raise Exception(f"Error processing CV: {str(e)}")
+            response_text = response.choices[0].message.content.strip()
+            start = response_text.find('{')
+            end = response_text.rfind('}') + 1
+            if start != -1 and end > start:
+                exp_letter_data = json.loads(response_text[start:end])
+                exp_letter_found = {"found": exp_letter_data.get("found", False), "details": exp_letter_data.get("details", "")}
+                
+                # Add to all_experiences with source
+                for exp in exp_letter_data.get("experiences", []):
+                    exp['source'] = 'Experience Letter'
+                    all_experiences.append(exp)
+        except:
+            pass
+    
+    # Step 7: Return merged results
+    return {
+        "personal_info": personal_info,
+        "experience_in_cif": cif_experience,
+        "experience_in_resume": resume_experience,
+        "experience_letter_found": exp_letter_found,
+        "all_experiences": all_experiences
+    }
 
 
 def cv_experience_parser_page():
@@ -591,13 +751,22 @@ def cv_experience_parser_page():
             status_text = st.empty()
             
             for idx, file in enumerate(uploaded_cv_files):
-                status_text.text(f"Processing {file.name}... ({idx + 1}/{len(uploaded_cv_files)})")
+                status_text.text(f"📄 Processing {file.name}... ({idx + 1}/{len(uploaded_cv_files)})")
+                
+                # Show processing steps
+                with st.expander(f"🔍 Processing Details: {file.name}", expanded=False):
+                    step_info = st.empty()
+                    step_info.info("📑 Step 1/4: Classifying pages by type...")
                 
                 try:
                     # Process CV using fallback keys
                     cv_data = create_groq_client_with_fallback(api_keys, process_cv_multipage, file)
                     cv_data['source_file'] = file.name
                     results.append(cv_data)
+                    
+                    # Show classification results
+                    with st.expander(f"🔍 Processing Details: {file.name}", expanded=False):
+                        step_info.success("✅ Processing complete!")
                     
                     # Add delay between requests
                     if idx < len(uploaded_cv_files) - 1:
