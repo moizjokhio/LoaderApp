@@ -595,6 +595,10 @@ def main():
     # Initialize session state for results
     if "results_df" not in st.session_state:
         st.session_state.results_df = None
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = set()
+    if "show_clear_confirmation" not in st.session_state:
+        st.session_state.show_clear_confirmation = False
     
     # Processing logic
     if process_button:
@@ -681,12 +685,45 @@ def main():
                 other_cols = [col for col in df.columns if col not in column_order]
                 df = df[existing_cols + other_cols]
                 
-                st.session_state.results_df = df
-                st.success(f"✅ Successfully processed {len(results)} document(s)!")
+                # Append to existing results instead of replacing
+                if st.session_state.results_df is not None:
+                    st.session_state.results_df = pd.concat([st.session_state.results_df, df], ignore_index=True)
+                else:
+                    st.session_state.results_df = df
+                
+                # Track processed files
+                for file in uploaded_files:
+                    st.session_state.processed_files.add(file.name)
+                
+                st.success(f"✅ Successfully processed {len(results)} document(s)! Total records: {len(st.session_state.results_df)}")
     
     # Display results
     if st.session_state.results_df is not None and not st.session_state.results_df.empty:
         st.markdown("---")
+        
+        # Info banner and clear button
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info(f"📌 **{len(st.session_state.results_df)} records in memory** | Processed files: {len(st.session_state.processed_files)} | Data persists until you click 'Clear All'")
+        with col2:
+            if st.button("🗑️ Clear All", use_container_width=True, type="secondary"):
+                st.session_state.show_clear_confirmation = True
+        
+        # Confirmation modal
+        if st.session_state.show_clear_confirmation:
+            st.warning("⚠️ **Are you sure you want to clear all data?** This action cannot be undone.")
+            col1, col2, col3 = st.columns([1, 1, 2])
+            with col1:
+                if st.button("✅ Yes, Clear", type="primary", use_container_width=True):
+                    st.session_state.results_df = None
+                    st.session_state.processed_files = set()
+                    st.session_state.show_clear_confirmation = False
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", use_container_width=True):
+                    st.session_state.show_clear_confirmation = False
+                    st.rerun()
+        
         st.markdown("### 📊 Extracted Data")
         
         # Display DataFrame
