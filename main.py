@@ -12,9 +12,78 @@ from groq import Groq
 import fitz  # PyMuPDF
 from PIL import Image, ImageFile
 import time
+import os
 
 # Allow loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# API Key Management with Fallback Support
+def get_api_keys():
+    """Get API keys from environment variables or session state with fallback support."""
+    keys = []
+    
+    # Primary key from session state (Settings page)
+    if 'groq_api_keys' in st.session_state and st.session_state['groq_api_keys']:
+        keys.extend(st.session_state['groq_api_keys'])
+    
+    # Fallback keys from environment variables
+    env_keys = [
+        os.getenv('GROQ_API_KEY'),
+        os.getenv('GROQ_API_KEY_2'),
+        os.getenv('GROQ_API_KEY_3'),
+        os.getenv('GROQ_API_KEY_4'),
+        os.getenv('GROQ_API_KEY_5')
+    ]
+    
+    # Add valid environment keys
+    for key in env_keys:
+        if key and key not in keys:
+            keys.append(key)
+    
+    return keys if keys else ['']
+
+def create_groq_client_with_fallback(api_keys, operation_func, *args, **kwargs):
+    """Try operation with primary key, fallback to other keys on rate limit.
+    
+    Args:
+        api_keys: List of API keys to try
+        operation_func: Function to execute (should accept client as first arg)
+        *args, **kwargs: Arguments to pass to operation_func
+    
+    Returns:
+        Result from operation_func
+    """
+    last_error = None
+    
+    for idx, key in enumerate(api_keys):
+        if not key:
+            continue
+            
+        try:
+            client = Groq(api_key=key)
+            return operation_func(client, *args, **kwargs)
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Check if it's a rate limit error
+            if "rate_limit" in error_msg.lower() or "429" in error_msg or "quota" in error_msg.lower():
+                if idx < len(api_keys) - 1:  # If there are more keys to try
+                    st.warning(f"⚠️ API Key {idx + 1} hit rate limit. Switching to fallback key {idx + 2}...")
+                    last_error = e
+                    continue
+                else:
+                    st.error(f"❌ All API keys exhausted. Rate limit reached on all keys.")
+                    raise e
+            else:
+                # Not a rate limit error, raise it
+                raise e
+    
+    # If we get here, all keys failed
+    if last_error:
+        raise last_error
+    else:
+        raise ValueError("No valid API keys provided")
 
 # System prompt with all business logic rules
 SYSTEM_PROMPT = """
@@ -361,26 +430,15 @@ def main():
     # Sidebar configuration
     with st.sidebar:
         st.image("https://img.icons8.com/color/96/000000/graduation-cap.png", width=80)
-        st.title("⚙️ Configuration")
+        st.title("⚙️ Navigation")
         st.markdown("---")
         
-        # API Key input - get from environment variable or user input
-        import os
-        default_api_key = os.getenv("GROQ_API_KEY", "")
-        
-        api_key = st.text_input(
-            "🔑 Groq API Key",
-            type="password",
-            value=st.session_state.get('groq_api_key', default_api_key),
-            help="Enter your Groq API key. Get free at: https://console.groq.com"
+        # Navigation
+        page = st.radio(
+            "Select Page",
+            ["📄 Document Parser", "📊 Spreadsheet Loader", "⚙️ Settings"],
+            label_visibility="collapsed"
         )
-        
-        # Store API key in session state for use in spreadsheet loader
-        if api_key:
-            st.session_state['groq_api_key'] = api_key
-        else:
-            st.session_state['groq_api_key'] = default_api_key
-            api_key = default_api_key
         
         st.markdown("---")
         
@@ -394,10 +452,10 @@ def main():
         st.markdown("---")
         
         # Instructions
-        st.markdown("### 📋 Instructions")
+        st.markdown("### 📋 Quick Guide")
         st.markdown("""
-        1. Get free API key from [Groq Console](https://console.groq.com/keys)
-        2. Enter your Groq API Key
+        1. Configure API keys in Settings
+        2. Upload documents or spreadsheets
         3. Enter the Person Number
         4. Upload document images/PDFs
         5. Click **Process Documents**
@@ -416,7 +474,78 @@ def main():
         - Diplomas (DAE)
         """)
     
-    # Main area
+    # Check if Settings page
+    if page == "⚙️ Settings":
+        # Settings Page
+        st.markdown('<div class="main-header">⚙️ Settings</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub-header">Configure API Keys and Application Settings</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        st.markdown("### 🔑 API Key Management")
+        st.info("💡 Add multiple API keys for automatic fallback when rate limits are reached.")
+        
+        # Initialize session state for API keys
+        if 'groq_api_keys' not in st.session_state:
+            st.session_state['groq_api_keys'] = get_api_keys()
+        
+        # Display current keys
+        st.markdown("#### Current API Keys:")
+        
+        keys_to_remove = []
+        for idx, key in enumerate(st.session_state['groq_api_keys']):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                masked_key = f"{key[:10]}...{key[-8:]}" if key and len(key) > 18 else "Empty"
+                st.text_input(
+                    f"API Key {idx + 1}",
+                    value=masked_key,
+                    disabled=True,
+                    key=f"key_display_{idx}"
+                )
+            with col2:
+                if st.button("🗑️", key=f"remove_{idx}"):
+                    keys_to_remove.append(idx)
+        
+        # Remove keys marked for deletion
+        for idx in reversed(keys_to_remove):
+            st.session_state['groq_api_keys'].pop(idx)
+            st.rerun()
+        
+        # Add new key
+        st.markdown("#### Add New API Key:")
+        new_key = st.text_input(
+            "Enter API Key",
+            type="password",
+            placeholder="gsk_...",
+            key="new_api_key_input"
+        )
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("➕ Add Key", use_container_width=True):
+                if new_key and new_key not in st.session_state['groq_api_keys']:
+                    st.session_state['groq_api_keys'].append(new_key)
+                    st.success("✅ API Key added successfully!")
+                    st.rerun()
+                elif new_key in st.session_state['groq_api_keys']:
+                    st.warning("⚠️ This key already exists!")
+                else:
+                    st.error("⚠️ Please enter a valid API key")
+        
+        st.markdown("---")
+        st.markdown("### 📚 Resources")
+        st.markdown("""
+        - Get free API keys: [Groq Console](https://console.groq.com/keys)
+        - API Documentation: [Groq Docs](https://console.groq.com/docs)
+        - Rate Limits: 30 requests/minute per key
+        """)
+        
+        st.markdown("---")
+        st.markdown(f"**Total Keys Configured:** {len([k for k in st.session_state['groq_api_keys'] if k])}")
+        
+        return  # Exit early, don't show main content
+    
+    # Main area - Document Parser
     st.markdown('<div class="main-header">🎓 EduParser</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">Pakistani Educational Document Parser powered by Groq (Lightning Fast & Free)</div>', unsafe_allow_html=True)
     
@@ -452,11 +581,15 @@ def main():
     # Process button
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
+        # Get API keys
+        api_keys = get_api_keys()
+        has_valid_keys = any(k for k in api_keys)
+        
         process_button = st.button(
             "🚀 Process Documents",
             type="primary",
             use_container_width=True,
-            disabled=not (uploaded_files and api_key)
+            disabled=not (uploaded_files and has_valid_keys)
         )
     
     # Initialize session state for results
@@ -465,18 +598,17 @@ def main():
     
     # Processing logic
     if process_button:
-        if not api_key:
-            st.error("⚠️ Please enter your Groq API Key in the sidebar.")
+        api_keys = get_api_keys()
+        
+        if not any(k for k in api_keys):
+            st.error("⚠️ Please configure your Groq API Keys in Settings page.")
         elif not uploaded_files:
             st.error("⚠️ Please upload at least one document image.")
         elif not person_number:
             st.warning("⚠️ Person Number is empty. Records will be created without it.")
             
-        if api_key and uploaded_files:
-            # Initialize Groq client
-            client = Groq(api_key=api_key)
-            
-            # Process each document
+        if any(k for k in api_keys) and uploaded_files:
+            # Process each document with fallback support
             results = []
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -485,8 +617,8 @@ def main():
                 status_text.text(f"Processing {file.name}... ({idx + 1}/{len(uploaded_files)})")
                 
                 try:
-                    # Process the document (may return multiple records if merged)
-                    documents = process_document(client, file)
+                    # Process the document using fallback keys
+                    documents = create_groq_client_with_fallback(api_keys, process_document, file)
                     
                     # Add person number and source file to each document
                     for doc_idx, result in enumerate(documents):
@@ -515,22 +647,6 @@ def main():
                     # Handle invalid/corrupted images
                     if "Invalid or corrupted image" in error_msg:
                         st.warning(f"⚠️ Skipped {file.name}: Invalid or corrupted image file")
-                    # Handle rate limits
-                    elif "Rate limit exceeded" in error_msg or "429" in error_msg or "quota" in error_msg.lower():
-                        st.error(f"⚠️ Rate limit reached at {file.name}. Waiting 60 seconds before continuing...")
-                        time.sleep(60)  # Wait 1 minute then continue
-                        # Retry this file
-                        try:
-                            documents = process_document(client, file)
-                            for doc_idx, result in enumerate(documents):
-                                result["Person Number"] = person_number if person_number else ""
-                                result["Source File"] = file.name
-                                if len(documents) > 1:
-                                    result["Source File"] = f"{file.name} (Doc {doc_idx + 1}/{len(documents)})"
-                                results.append(result)
-                            st.success(f"✅ Successfully processed {file.name} after rate limit wait")
-                        except Exception as retry_error:
-                            st.error(f"❌ Failed to process {file.name} even after waiting: {str(retry_error)}")
                     else:
                         st.error(f"❌ Error processing {file.name}: {str(e)}")
                 
@@ -782,8 +898,9 @@ def spreadsheet_loader():
                 st.info(f"Available columns: {', '.join(edu_df.columns)}")
                 return
             
-            # Get API key for AI matching
-            api_key = st.session_state.get('groq_api_key', '')
+            # Get API keys for AI matching
+            api_keys = get_api_keys()
+            has_api_keys = any(k for k in api_keys)
             
             # Normalize names for matching using robust normalization
             emp_df['name_normalized'] = emp_df['FULL_NAME'].apply(normalize_name)
@@ -851,11 +968,10 @@ def spreadsheet_loader():
             unmatched_mask = merged_df['CNIC'].isna()
             unmatched_edu_names = merged_df.loc[unmatched_mask, 'Name'].unique().tolist()
             
-            # If there are unmatched records and API key exists, use AI matching
-            if len(unmatched_edu_names) > 0 and api_key:
+            # If there are unmatched records and API keys exist, use AI matching
+            if len(unmatched_edu_names) > 0 and has_api_keys:
                 st.info(f"🤖 Using AI to match {len(unmatched_edu_names)} unmatched names...")
                 
-                client = Groq(api_key=api_key)
                 emp_names_list = emp_df_unique['FULL_NAME'].tolist()
                 
                 # AI matching in batches of 20 to avoid token limits
@@ -865,7 +981,8 @@ def spreadsheet_loader():
                 
                 for i in range(0, len(unmatched_edu_names), batch_size):
                     batch = unmatched_edu_names[i:i+batch_size]
-                    batch_matches = ai_match_names(client, batch, emp_names_list)
+                    # Use fallback keys for AI matching
+                    batch_matches = create_groq_client_with_fallback(api_keys, ai_match_names, batch, emp_names_list)
                     ai_matches.update(batch_matches)
                     progress_bar.progress(min((i + batch_size) / len(unmatched_edu_names), 1.0))
                     time.sleep(0.5)  # Rate limiting
