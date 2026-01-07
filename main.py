@@ -466,6 +466,328 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def process_cv_multipage(client, pdf_file) -> dict:
+    """
+    Process multi-page CV/Resume PDF and extract all information.
+    
+    Args:
+        client: Groq client instance
+        pdf_file: Uploaded PDF file
+        
+    Returns:
+        Dictionary with extracted data
+    """
+    # Open PDF and extract text from all pages
+    pdf_bytes = pdf_file.getvalue()
+    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    # Extract text from all pages
+    full_text = ""
+    for page_num in range(len(pdf_document)):
+        page = pdf_document[page_num]
+        full_text += f"\n\n--- Page {page_num + 1} ---\n\n"
+        full_text += page.get_text()
+    
+    pdf_document.close()
+    
+    # Create prompt for CV/Experience extraction
+    prompt = f"""You are an expert HR data extraction specialist. Extract ALL information from this CV/Resume document.
+
+DOCUMENT TEXT:
+{full_text}
+
+Extract and return ONLY a valid JSON object with this exact structure:
+
+{{
+  "personal_info": {{
+    "full_name": "Full name",
+    "father_name": "Father's name",
+    "cnic": "CNIC number (format: 00000-0000000-0)",
+    "email": "Email address",
+    "contact": "Phone number",
+    "nationality": "Nationality",
+    "date_of_birth": "YYYY-MM-DD",
+    "gender": "Male/Female",
+    "marital_status": "Single/Married/etc",
+    "address": "Complete address"
+  }},
+  "education": [
+    {{
+      "degree": "Degree name",
+      "institution": "Institution name",
+      "passing_year": "Year",
+      "grade": "Grade/GPA/Division"
+    }}
+  ],
+  "experience": [
+    {{
+      "employer": "Company/Organization name",
+      "designation": "Job title/Grade",
+      "date_joining": "DD/MM/YYYY",
+      "date_leaving": "DD/MM/YYYY or 'Present'",
+      "monthly_salary": "Salary amount (numbers only, or leave empty if not mentioned)",
+      "responsibilities": "Brief description of responsibilities"
+    }}
+  ],
+  "skills": ["List of skills"],
+  "languages": ["List of languages"]
+}}
+
+CRITICAL RULES:
+1. Extract ALL education entries found
+2. Extract ALL work experience entries found
+3. For dates: Use DD/MM/YYYY format. If only month/year given, use 01/MM/YYYY
+4. If information is not found, use empty string "" or empty array []
+5. For current/ongoing positions, use "Present" as date_leaving
+6. Extract salary as numbers only (remove "Rs", "PKR", commas, etc). If not mentioned, use ""
+7. Return ONLY valid JSON, no markdown, no explanations
+
+Extract from the entire document above."""
+
+    try:
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.05,
+            max_tokens=4000
+        )
+        
+        # Extract JSON from response
+        response_text = response.choices[0].message.content.strip()
+        
+        # Remove markdown code blocks if present
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+        
+        data = json.loads(response_text)
+        return data
+        
+    except Exception as e:
+        raise Exception(f"Error processing CV: {str(e)}")
+
+
+def cv_experience_parser_page():
+    """CV/Experience Parser Page - Extract data from CVs and Experience Letters."""
+    st.markdown('<div class="main-header">👔 CV/Experience Parser</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Extract complete profile data from CVs, Resumes & Experience Letters</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.info("📋 Upload multi-page CV/Resume PDFs. This tool extracts: Personal Info, Education, Work Experience, Skills & More!")
+    
+    # File uploader
+    st.markdown("### 📤 Upload CV/Resume Documents")
+    uploaded_cv_files = st.file_uploader(
+        "Upload CV/Resume PDFs (multi-page supported)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Upload complete CV/Resume PDFs. The system will extract all pages.",
+        key="cv_uploader"
+    )
+    
+    # Display uploaded files
+    if uploaded_cv_files:
+        st.markdown(f"**📁 {len(uploaded_cv_files)} file(s) uploaded**")
+        for file in uploaded_cv_files:
+            st.markdown(f"- 📄 **{file.name}**")
+    
+    st.markdown("---")
+    
+    # Process button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        api_keys = get_api_keys()
+        has_valid_keys = any(k for k in api_keys)
+        
+        process_cv_button = st.button(
+            "🚀 Process CVs",
+            type="primary",
+            use_container_width=True,
+            disabled=not (uploaded_cv_files and has_valid_keys),
+            key="process_cv_button"
+        )
+    
+    # Initialize session state for CV results
+    if "cv_results" not in st.session_state:
+        st.session_state.cv_results = []
+    
+    # Processing logic
+    if process_cv_button:
+        api_keys = get_api_keys()
+        
+        if not any(k for k in api_keys):
+            st.error("⚠️ Please configure your Groq API Keys in Settings page.")
+        elif not uploaded_cv_files:
+            st.error("⚠️ Please upload at least one CV/Resume PDF.")
+        else:
+            # Process each CV
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, file in enumerate(uploaded_cv_files):
+                status_text.text(f"Processing {file.name}... ({idx + 1}/{len(uploaded_cv_files)})")
+                
+                try:
+                    # Process CV using fallback keys
+                    cv_data = create_groq_client_with_fallback(api_keys, process_cv_multipage, file)
+                    cv_data['source_file'] = file.name
+                    results.append(cv_data)
+                    
+                    # Add delay between requests
+                    if idx < len(uploaded_cv_files) - 1:
+                        time.sleep(2.0)
+                    
+                except Exception as e:
+                    st.error(f"❌ Error processing {file.name}: {str(e)}")
+                
+                # Update progress
+                progress_bar.progress((idx + 1) / len(uploaded_cv_files))
+            
+            status_text.text("✅ Processing complete!")
+            
+            # Append to existing results
+            st.session_state.cv_results.extend(results)
+            st.success(f"✅ Successfully processed {len(results)} CV(s)! Total: {len(st.session_state.cv_results)}")
+    
+    # Display results
+    if st.session_state.cv_results:
+        st.markdown("---")
+        
+        # Clear button
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info(f"📌 **{len(st.session_state.cv_results)} CV(s) processed**")
+        with col2:
+            if st.button("🗑️ Clear All", use_container_width=True, type="secondary", key="clear_cv_button"):
+                st.session_state.cv_results = []
+                st.rerun()
+        
+        # Convert to DataFrames for display
+        st.markdown("### 👤 Personal Information")
+        personal_data = []
+        for cv in st.session_state.cv_results:
+            info = cv.get('personal_info', {})
+            info['source_file'] = cv.get('source_file', '')
+            personal_data.append(info)
+        
+        df_personal = pd.DataFrame(personal_data)
+        st.dataframe(df_personal, use_container_width=True, hide_index=True)
+        
+        # Education
+        st.markdown("### 🎓 Education")
+        education_data = []
+        for cv in st.session_state.cv_results:
+            name = cv.get('personal_info', {}).get('full_name', 'Unknown')
+            cnic = cv.get('personal_info', {}).get('cnic', '')
+            for edu in cv.get('education', []):
+                edu_row = {
+                    'Name': name,
+                    'CNIC': cnic,
+                    **edu,
+                    'source_file': cv.get('source_file', '')
+                }
+                education_data.append(edu_row)
+        
+        if education_data:
+            df_education = pd.DataFrame(education_data)
+            st.dataframe(df_education, use_container_width=True, hide_index=True)
+        else:
+            st.info("No education data found")
+        
+        # Experience
+        st.markdown("### 💼 Work Experience / Previous Employers")
+        experience_data = []
+        for cv in st.session_state.cv_results:
+            name = cv.get('personal_info', {}).get('full_name', 'Unknown')
+            cnic = cv.get('personal_info', {}).get('cnic', '')
+            for exp in cv.get('experience', []):
+                exp_row = {
+                    'Name': name,
+                    'CNIC': cnic,
+                    'Previous Employer': exp.get('employer', ''),
+                    'Designation/Grade': exp.get('designation', ''),
+                    'Date of Joining': exp.get('date_joining', ''),
+                    'Date of Leaving': exp.get('date_leaving', ''),
+                    'Monthly Salary': exp.get('monthly_salary', ''),
+                    'Responsibilities': exp.get('responsibilities', ''),
+                    'source_file': cv.get('source_file', '')
+                }
+                experience_data.append(exp_row)
+        
+        if experience_data:
+            df_experience = pd.DataFrame(experience_data)
+            st.dataframe(df_experience, use_container_width=True, hide_index=True)
+        else:
+            st.info("No experience data found")
+        
+        # Skills & Languages
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### 🛠️ Skills")
+            for cv in st.session_state.cv_results:
+                name = cv.get('personal_info', {}).get('full_name', 'Unknown')
+                skills = cv.get('skills', [])
+                if skills:
+                    st.markdown(f"**{name}:**")
+                    st.markdown(", ".join(skills))
+        
+        with col2:
+            st.markdown("### 🌐 Languages")
+            for cv in st.session_state.cv_results:
+                name = cv.get('personal_info', {}).get('full_name', 'Unknown')
+                languages = cv.get('languages', [])
+                if languages:
+                    st.markdown(f"**{name}:**")
+                    st.markdown(", ".join(languages))
+        
+        # Download buttons
+        st.markdown("---")
+        st.markdown("### 📥 Download Extracted Data")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if not df_personal.empty:
+                personal_excel = convert_df_to_excel(df_personal)
+                st.download_button(
+                    label="📥 Personal Info",
+                    data=personal_excel,
+                    file_name="personal_information.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+        
+        with col2:
+            if education_data:
+                education_excel = convert_df_to_excel(df_education)
+                st.download_button(
+                    label="📥 Education",
+                    data=education_excel,
+                    file_name="education_details.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+        
+        with col3:
+            if experience_data:
+                experience_excel = convert_df_to_excel(df_experience)
+                st.download_button(
+                    label="📥 Experience",
+                    data=experience_excel,
+                    file_name="work_experience.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
+
 def main():
     """Main application function."""
     # Page configuration
@@ -515,7 +837,7 @@ def main():
         # Navigation
         page = st.radio(
             "Select Page",
-            ["📄 Document Parser", "📊 Spreadsheet Loader", "⚙️ Settings"],
+            ["📄 Document Parser", "📊 Spreadsheet Loader", "👔 CV/Experience Parser", "⚙️ Settings"],
             label_visibility="collapsed"
         )
         
@@ -552,6 +874,11 @@ def main():
         - Master's Degrees
         - Diplomas (DAE)
         """)
+    
+    # Check if CV/Experience Parser page
+    if page == "👔 CV/Experience Parser":
+        cv_experience_parser_page()
+        return  # Exit early
     
     # Check if Settings page
     if page == "⚙️ Settings":
