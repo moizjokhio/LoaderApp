@@ -392,7 +392,8 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
 
 def process_cv_multipage(client, pdf_file) -> dict:
     """
-    Process multi-page CV/Resume PDF and extract all information.
+    Process multi-page CV/Resume PDF and extract EXPERIENCE information.
+    Looks for experience in: CIF Professional Information, Resume/CV, Experience Letters
     
     Args:
         client: Groq client instance
@@ -409,93 +410,108 @@ def process_cv_multipage(client, pdf_file) -> dict:
     full_text = ""
     for page_num in range(len(pdf_document)):
         page = pdf_document[page_num]
-        full_text += f"\n\n--- Page {page_num + 1} ---\n\n"
+        full_text += f"\n\n========== PAGE {page_num + 1} ==========\n\n"
         full_text += page.get_text()
     
     pdf_document.close()
     
-    # Create prompt for CV/Experience extraction
-    prompt = f"""You are an expert HR data extraction specialist. Extract ALL information from this CV/Resume document.
+    # Create focused prompt for EXPERIENCE extraction
+    prompt = f"""You are an HR expert. Extract ALL experience/work history information from this document.
+
+This is a merged candidate document that may contain:
+1. Candidate Information Form (CIF) with "Professional Information" section
+2. Resume/CV with "Experience" or "Work History" section  
+3. Experience Letters from previous employers
 
 DOCUMENT TEXT:
-{full_text}
+{full_text[:15000]}
 
-Extract and return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object (no markdown, no explanations):
 
 {{
   "personal_info": {{
-    "full_name": "Full name",
-    "father_name": "Father's name",
-    "cnic": "CNIC number (format: 00000-0000000-0)",
-    "email": "Email address",
-    "contact": "Phone number",
-    "nationality": "Nationality",
-    "date_of_birth": "YYYY-MM-DD",
-    "gender": "Male/Female",
-    "marital_status": "Single/Married/etc",
-    "address": "Complete address"
+    "full_name": "Extract full name",
+    "cnic": "Extract CNIC (format: 00000-0000000-0)",
+    "email": "Extract email",
+    "contact": "Extract phone number"
   }},
-  "education": [
+  "experience_in_cif": {{
+    "found": true/false,
+    "details": "If found in Professional Information section of CIF, write brief summary. Otherwise empty string"
+  }},
+  "experience_in_resume": {{
+    "found": true/false,
+    "details": "If found in Resume/CV Experience section, write brief summary. Otherwise empty string"
+  }},
+  "experience_letter_found": {{
+    "found": true/false,
+    "details": "If experience certificate/letter found, write issuing company. Otherwise empty string"
+  }},
+  "all_experiences": [
     {{
-      "degree": "Degree name",
-      "institution": "Institution name",
-      "passing_year": "Year",
-      "grade": "Grade/GPA/Division"
+      "source": "CIF" or "Resume" or "Experience Letter",
+      "employer": "Company name",
+      "designation": "Job title",
+      "date_joining": "DD/MM/YYYY or MM/YYYY",
+      "date_leaving": "DD/MM/YYYY or MM/YYYY or Present",
+      "duration_months": "Calculate total months worked",
+      "monthly_salary": "Extract if mentioned, otherwise empty",
+      "responsibilities": "Brief summary"
     }}
-  ],
-  "experience": [
-    {{
-      "employer": "Company/Organization name",
-      "designation": "Job title/Grade",
-      "date_joining": "DD/MM/YYYY",
-      "date_leaving": "DD/MM/YYYY or 'Present'",
-      "monthly_salary": "Salary amount (numbers only, or leave empty if not mentioned)",
-      "responsibilities": "Brief description of responsibilities"
-    }}
-  ],
-  "skills": ["List of skills"],
-  "languages": ["List of languages"]
+  ]
 }}
 
 CRITICAL RULES:
-1. Extract ALL education entries found
-2. Extract ALL work experience entries found
-3. For dates: Use DD/MM/YYYY format. If only month/year given, use 01/MM/YYYY
-4. If information is not found, use empty string "" or empty array []
-5. For current/ongoing positions, use "Present" as date_leaving
-6. Extract salary as numbers only (remove "Rs", "PKR", commas, etc). If not mentioned, use ""
-7. Return ONLY valid JSON, no markdown, no explanations
+1. found = true ONLY if actual work experience is mentioned (not courses/internships unless paid professional internships)
+2. Extract from ALL sources found in the document
+3. If dates only show month/year, use 01/MM/YYYY format
+4. Calculate duration_months = (leaving_date - joining_date) in months
+5. Mark source clearly: "CIF", "Resume", or "Experience Letter"
+6. Return ONLY valid JSON - no text before or after
+7. If experience section exists but is empty/not filled, found = false
 
-Extract from the entire document above."""
+RETURN ONLY THE JSON OBJECT NOTHING ELSE."""
 
-    try:
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.05,
+                max_tokens=4000
+            )
+            
+            # Extract JSON from response
+            response_text = response.choices[0].message.content.strip()
+            
+            # Clean up response - remove markdown, extra text
+            # Find the JSON object
+            start = response_text.find('{')
+            end = response_text.rfind('}') + 1
+            
+            if start != -1 and end > start:
+                response_text = response_text[start:end]
+            
+            # Try to parse JSON
+            data = json.loads(response_text)
+            return data
+            
+        except json.JSONDecodeError as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            else:
+                # Return empty structure if all retries fail
+                return {
+                    "personal_info": {"full_name": "Parse Error", "cnic": "", "email": "", "contact": ""},
+                    "experience_in_cif": {"found": False, "details": f"JSON Error: {str(e)}"},
+                    "experience_in_resume": {"found": False, "details": ""},
+                    "experience_letter_found": {"found": False, "details": ""},
+                    "all_experiences": []
                 }
-            ],
-            temperature=0.05,
-            max_tokens=4000
-        )
-        
-        # Extract JSON from response
-        response_text = response.choices[0].message.content.strip()
-        
-        # Remove markdown code blocks if present
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
-        
-        data = json.loads(response_text)
-        return data
-        
-    except Exception as e:
-        raise Exception(f"Error processing CV: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Error processing CV: {str(e)}")
 
 
 def cv_experience_parser_page():
@@ -588,125 +604,92 @@ def cv_experience_parser_page():
         # Clear button
         col1, col2 = st.columns([3, 1])
         with col1:
-            st.info(f"📌 **{len(st.session_state.cv_results)} CV(s) processed**")
+            st.info(f"📌 **{len(st.session_state.cv_results)} candidate(s) processed**")
         with col2:
             if st.button("🗑️ Clear All", use_container_width=True, type="secondary", key="clear_cv_button"):
                 st.session_state.cv_results = []
                 st.rerun()
         
-        # Convert to DataFrames for display
-        st.markdown("### 👤 Personal Information")
-        personal_data = []
+        # EXPERIENCE SUMMARY TABLE
+        st.markdown("### 📊 Experience Summary")
+        summary_data = []
         for cv in st.session_state.cv_results:
-            info = cv.get('personal_info', {})
-            info['source_file'] = cv.get('source_file', '')
-            personal_data.append(info)
+            personal = cv.get('personal_info', {})
+            exp_cif = cv.get('experience_in_cif', {})
+            exp_resume = cv.get('experience_in_resume', {})
+            exp_letter = cv.get('experience_letter_found', {})
+            
+            summary_data.append({
+                'Name': personal.get('full_name', 'Unknown'),
+                'CNIC': personal.get('cnic', ''),
+                'Contact': personal.get('contact', ''),
+                'Email': personal.get('email', ''),
+                'Experience in CIF': 'YES' if exp_cif.get('found') else 'NO',
+                'CIF Details': exp_cif.get('details', ''),
+                'Experience in Resume': 'YES' if exp_resume.get('found') else 'NO',
+                'Resume Details': exp_resume.get('details', ''),
+                'Experience Letter Attached': 'YES' if exp_letter.get('found') else 'NO',
+                'Letter Details': exp_letter.get('details', ''),
+                'Total Experience Records': len(cv.get('all_experiences', [])),
+                'Source File': cv.get('source_file', '')
+            })
         
-        df_personal = pd.DataFrame(personal_data)
-        st.dataframe(df_personal, use_container_width=True, hide_index=True)
+        df_summary = pd.DataFrame(summary_data)
+        st.dataframe(df_summary, use_container_width=True, hide_index=True)
         
-        # Education
-        st.markdown("### 🎓 Education")
-        education_data = []
+        # DETAILED EXPERIENCE TABLE
+        st.markdown("### 💼 Detailed Work Experience")
+        detailed_exp = []
         for cv in st.session_state.cv_results:
-            name = cv.get('personal_info', {}).get('full_name', 'Unknown')
-            cnic = cv.get('personal_info', {}).get('cnic', '')
-            for edu in cv.get('education', []):
-                edu_row = {
+            personal = cv.get('personal_info', {})
+            name = personal.get('full_name', 'Unknown')
+            cnic = personal.get('cnic', '')
+            
+            for exp in cv.get('all_experiences', []):
+                detailed_exp.append({
                     'Name': name,
                     'CNIC': cnic,
-                    **edu,
-                    'source_file': cv.get('source_file', '')
-                }
-                education_data.append(edu_row)
-        
-        if education_data:
-            df_education = pd.DataFrame(education_data)
-            st.dataframe(df_education, use_container_width=True, hide_index=True)
-        else:
-            st.info("No education data found")
-        
-        # Experience
-        st.markdown("### 💼 Work Experience / Previous Employers")
-        experience_data = []
-        for cv in st.session_state.cv_results:
-            name = cv.get('personal_info', {}).get('full_name', 'Unknown')
-            cnic = cv.get('personal_info', {}).get('cnic', '')
-            for exp in cv.get('experience', []):
-                exp_row = {
-                    'Name': name,
-                    'CNIC': cnic,
-                    'Previous Employer': exp.get('employer', ''),
+                    'Source': exp.get('source', ''),
+                    'Employer': exp.get('employer', ''),
                     'Designation/Grade': exp.get('designation', ''),
                     'Date of Joining': exp.get('date_joining', ''),
                     'Date of Leaving': exp.get('date_leaving', ''),
+                    'Duration (Months)': exp.get('duration_months', ''),
                     'Monthly Salary': exp.get('monthly_salary', ''),
                     'Responsibilities': exp.get('responsibilities', ''),
-                    'source_file': cv.get('source_file', '')
-                }
-                experience_data.append(exp_row)
+                    'Source File': cv.get('source_file', '')
+                })
         
-        if experience_data:
-            df_experience = pd.DataFrame(experience_data)
-            st.dataframe(df_experience, use_container_width=True, hide_index=True)
+        if detailed_exp:
+            df_detailed = pd.DataFrame(detailed_exp)
+            st.dataframe(df_detailed, use_container_width=True, hide_index=True)
         else:
-            st.info("No experience data found")
-        
-        # Skills & Languages
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("### 🛠️ Skills")
-            for cv in st.session_state.cv_results:
-                name = cv.get('personal_info', {}).get('full_name', 'Unknown')
-                skills = cv.get('skills', [])
-                if skills:
-                    st.markdown(f"**{name}:**")
-                    st.markdown(", ".join(skills))
-        
-        with col2:
-            st.markdown("### 🌐 Languages")
-            for cv in st.session_state.cv_results:
-                name = cv.get('personal_info', {}).get('full_name', 'Unknown')
-                languages = cv.get('languages', [])
-                if languages:
-                    st.markdown(f"**{name}:**")
-                    st.markdown(", ".join(languages))
+            st.warning("⚠️ No experience records found in processed documents")
         
         # Download buttons
         st.markdown("---")
         st.markdown("### 📥 Download Extracted Data")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
-            if not df_personal.empty:
-                personal_excel = convert_df_to_excel(df_personal)
+            if not df_summary.empty:
+                summary_excel = convert_df_to_excel(df_summary)
                 st.download_button(
-                    label="📥 Personal Info",
-                    data=personal_excel,
-                    file_name="personal_information.xlsx",
+                    label="📥 Experience Summary",
+                    data=summary_excel,
+                    file_name="experience_summary.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
         
         with col2:
-            if education_data:
-                education_excel = convert_df_to_excel(df_education)
+            if detailed_exp:
+                detailed_excel = convert_df_to_excel(df_detailed)
                 st.download_button(
-                    label="📥 Education",
-                    data=education_excel,
-                    file_name="education_details.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        
-        with col3:
-            if experience_data:
-                experience_excel = convert_df_to_excel(df_experience)
-                st.download_button(
-                    label="📥 Experience",
-                    data=experience_excel,
-                    file_name="work_experience.xlsx",
+                    label="📥 Detailed Experience",
+                    data=detailed_excel,
+                    file_name="detailed_experience.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
