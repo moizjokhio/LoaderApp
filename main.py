@@ -364,13 +364,15 @@ def main():
         st.title("⚙️ Configuration")
         st.markdown("---")
         
-        # API Key input (hardcoded default)
-        default_api_key = "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"
+        # API Key input - get from environment variable or user input
+        import os
+        default_api_key = os.getenv("GROQ_API_KEY", "")
+        
         api_key = st.text_input(
             "🔑 Groq API Key",
             type="password",
             value=st.session_state.get('groq_api_key', default_api_key),
-            help="Using default Groq API key (you can replace it if needed)"
+            help="Enter your Groq API key. Get free at: https://console.groq.com"
         )
         
         # Store API key in session state for use in spreadsheet loader
