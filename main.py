@@ -13,9 +13,88 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageFile
 import time
 import os
+import uuid
+from streamlit.components.v1 import html
 
 # Allow loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Browser SessionStorage for data persistence across refreshes
+def get_session_id():
+    """Generate or retrieve a unique session ID for this browser tab."""
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    return st.session_state.session_id
+
+def save_to_browser_storage(key, data):
+    """Save data to browser's sessionStorage (persists across page refreshes)."""
+    if data is None:
+        data_json = "null"
+    else:
+        # Convert DataFrame to JSON if needed
+        if isinstance(data, pd.DataFrame):
+            data_json = data.to_json(orient='split', date_format='iso')
+        elif isinstance(data, set):
+            data_json = json.dumps(list(data))
+        else:
+            data_json = json.dumps(data)
+    
+    html(f"""
+        <script>
+            sessionStorage.setItem('{key}', {json.dumps(data_json)});
+        </script>
+    """, height=0)
+
+def load_from_browser_storage(key, default=None):
+    """Load data from browser's sessionStorage."""
+    # Use a unique component key to force re-execution
+    component_key = f"load_{key}_{get_session_id()}"
+    
+    # Check if we already loaded this in session state
+    storage_key = f"storage_{key}"
+    if storage_key in st.session_state:
+        return st.session_state[storage_key]
+    
+    # Try to load from browser storage
+    result = html(f"""
+        <script>
+            var data = sessionStorage.getItem('{key}');
+            if (data) {{
+                parent.postMessage({{type: 'streamlit:setComponentValue', value: data}}, '*');
+            }} else {{
+                parent.postMessage({{type: 'streamlit:setComponentValue', value: null}}, '*');
+            }}
+        </script>
+    """, height=0, key=component_key)
+    
+    if result:
+        try:
+            data_json = json.loads(result)
+            if key.endswith('_df') and data_json:
+                # Reconstruct DataFrame
+                data = pd.read_json(data_json, orient='split')
+            elif key.endswith('_files') and data_json:
+                # Reconstruct set
+                data = set(data_json)
+            else:
+                data = data_json
+            st.session_state[storage_key] = data
+            return data
+        except:
+            pass
+    
+    st.session_state[storage_key] = default
+    return default
+
+def clear_browser_storage():
+    """Clear all data from browser's sessionStorage."""
+    session_id = get_session_id()
+    html(f"""
+        <script>
+            sessionStorage.removeItem('results_df_{session_id}');
+            sessionStorage.removeItem('processed_files_{session_id}');
+        </script>
+    """, height=0)
 
 # API Key Management with Fallback Support
 def get_api_keys():
@@ -592,11 +671,18 @@ def main():
             disabled=not (uploaded_files and has_valid_keys)
         )
     
-    # Initialize session state for results
+    # Initialize session state for results - Load from browser storage on first load
+    session_id = get_session_id()
+    
     if "results_df" not in st.session_state:
-        st.session_state.results_df = None
+        # Try to load from browser storage
+        stored_df = load_from_browser_storage(f'results_df_{session_id}', None)
+        st.session_state.results_df = stored_df
+    
     if "processed_files" not in st.session_state:
-        st.session_state.processed_files = set()
+        stored_files = load_from_browser_storage(f'processed_files_{session_id}', set())
+        st.session_state.processed_files = stored_files
+    
     if "show_clear_confirmation" not in st.session_state:
         st.session_state.show_clear_confirmation = False
     
@@ -695,6 +781,10 @@ def main():
                 for file in uploaded_files:
                     st.session_state.processed_files.add(file.name)
                 
+                # Save to browser storage for persistence across refreshes
+                save_to_browser_storage(f'results_df_{session_id}', st.session_state.results_df)
+                save_to_browser_storage(f'processed_files_{session_id}', st.session_state.processed_files)
+                
                 st.success(f"✅ Successfully processed {len(results)} document(s)! Total records: {len(st.session_state.results_df)}")
     
     # Display results
@@ -704,7 +794,7 @@ def main():
         # Info banner and clear button
         col1, col2 = st.columns([3, 1])
         with col1:
-            st.info(f"📌 **{len(st.session_state.results_df)} records in memory** | Processed files: {len(st.session_state.processed_files)} | Data persists until you click 'Clear All'")
+            st.info(f"📌 **{len(st.session_state.results_df)} records** | Processed files: {len(st.session_state.processed_files)} | 💾 Data persists across page refreshes (same tab)")
         with col2:
             if st.button("🗑️ Clear All", use_container_width=True, type="secondary"):
                 st.session_state.show_clear_confirmation = True
@@ -715,9 +805,12 @@ def main():
             col1, col2, col3 = st.columns([1, 1, 2])
             with col1:
                 if st.button("✅ Yes, Clear", type="primary", use_container_width=True):
+                    # Clear session state
                     st.session_state.results_df = None
                     st.session_state.processed_files = set()
                     st.session_state.show_clear_confirmation = False
+                    # Clear browser storage
+                    clear_browser_storage()
                     st.rerun()
             with col2:
                 if st.button("❌ Cancel", use_container_width=True):
