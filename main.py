@@ -14,6 +14,14 @@ from PIL import Image, ImageFile
 import time
 import os
 
+# OCR imports
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
 # Allow loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -72,11 +80,11 @@ def create_groq_client_with_fallback(api_keys, operation_func, *args, **kwargs):
             # Check if it's a rate limit error
             if "rate_limit" in error_msg.lower() or "429" in error_msg or "quota" in error_msg.lower():
                 if idx < len(api_keys) - 1:  # If there are more keys to try
-                    st.warning(f"⚠️ API Key {idx + 1} hit rate limit. Switching to fallback key {idx + 2}...")
+                    st.warning(f"[!] API Key {idx + 1} hit rate limit. Switching to fallback key {idx + 2}...")
                     last_error = e
                     continue
                 else:
-                    st.error(f"❌ All API keys exhausted. Rate limit reached on all keys.")
+                    st.error(f"[X] All API keys exhausted. Rate limit reached on all keys.")
                     raise e
             else:
                 # Not a rate limit error, raise it
@@ -390,75 +398,75 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def classify_page_type(page_text: str) -> str:
+def extract_text_with_ocr(page, page_num: int, pdf_bytes: bytes) -> tuple:
     """
-    Classify a page as CIF, Resume, Experience Letter, or Other.
-    Uses keyword matching for fast classification.
+    Extract text from PDF page with OCR fallback.
+    Returns: (text, used_ocr)
     """
-    text_lower = page_text.lower()
+    # Try normal text extraction first
+    text = page.get_text()
     
-    # CIF keywords
-    cif_keywords = [
-        'candidate information form',
-        'professional information',
-        'present employer',
-        'employment status',
-        'basic pay scale',
-        'date of joining present post'
-    ]
+    # If text is too short (likely scanned image), use OCR
+    if len(text.strip()) < 50 and OCR_AVAILABLE:
+        try:
+            # Convert specific page to image
+            images = convert_from_bytes(pdf_bytes, first_page=page_num+1, last_page=page_num+1, dpi=300)
+            if images:
+                # Perform OCR
+                ocr_text = pytesseract.image_to_string(images[0], lang='eng')
+                if len(ocr_text.strip()) > len(text.strip()):
+                    return ocr_text, True
+        except Exception as e:
+            # OCR failed, use original text
+            pass
     
-    # Resume keywords
-    resume_keywords = [
-        'summary',
-        'objective',
-        'skills',
-        'work experience',
-        'employment history',
-        'projects',
-        'certifications'
-    ]
-    
-    # Experience Letter keywords
-    exp_letter_keywords = [
-        'experience certificate',
-        'experience letter',
-        'to whom it may concern',
-        'this is to certify',
-        'worked as',
-        'designation',
-        'has been working',
-        'stamp and signature'
-    ]
-    
-    # Count matches
-    cif_score = sum(1 for kw in cif_keywords if kw in text_lower)
-    resume_score = sum(1 for kw in resume_keywords if kw in text_lower)
-    exp_letter_score = sum(1 for kw in exp_letter_keywords if kw in text_lower)
-    
-    # Classify based on highest score
-    max_score = max(cif_score, resume_score, exp_letter_score)
-    
-    if max_score == 0:
-        return "Other"
-    elif cif_score == max_score:
-        return "CIF"
-    elif exp_letter_score == max_score:
-        return "Experience Letter"
-    elif resume_score == max_score:
-        return "Resume"
-    else:
-        return "Other"
+    return text, False
 
 
 def process_cv_multipage(client, pdf_file) -> dict:
     """
-    SMART APPROACH: Process multi-page CV/Resume PDF with page classification.
+    TWO-PASS HYBRID + OCR APPROACH:
     
-    Strategy:
-    1. Classify each page by type (CIF, Resume, Experience Letter, Other)
-    2. Group pages by type
-    3. Extract experience from each group with targeted prompts
-    4. Merge results
+    Pass 1: Document Structure Discovery (AI analyzes sample pages)
+        - Identify which pages contain: CIF, Resume, Experience Letters
+        - Returns page ranges for each section
+    
+    Pass 2: Targeted Deep Extraction (3 focused AI calls)
+        - Extract CIF experience (FULL text of CIF pages)
+        - Extract Resume experience (FULL text of Resume pages)
+        - Extract Experience Letters (FULL text of Letter pages)
+    
+    OCR: Automatic fallback for scanned/image pages
+    
+    Args:
+        client: Groq client instance
+        pdf_file: Uploaded PDF file
+        
+    Returns:
+        Dictionary with extracted data
+    """
+    # Open PDF
+    pdf_bytes = pdf_file.getvalue()
+    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(pdf_document)
+    
+    # Extract all pages with OCR fallback
+    pages_data = []
+    ocr_used_pages = []
+    
+    for page_num in range(total_pages):
+        page = pdf_document[page_num]
+        page_text, used_ocr = extract_text_with_ocr(page, page_num, pdf_bytes)
+        
+        pages_data.append({
+            'page_num': page_num + 1,
+            'text': page_text
+        })
+        
+        if used_ocr:
+            ocr_used_pages.append(page_num + 1)
+    
+    pdf_document.close()
     
     Args:
         client: Groq client instance
@@ -486,31 +494,99 @@ def process_cv_multipage(client, pdf_file) -> dict:
     
     pdf_document.close()
     
-    # Step 2: Group pages by type
-    cif_pages = [p for p in pages_data if p['type'] == 'CIF']
-    resume_pages = [p for p in pages_data if p['type'] == 'Resume']
-    exp_letter_pages = [p for p in pages_data if p['type'] == 'Experience Letter']
+    # ========== PASS 1: DOCUMENT STRUCTURE DISCOVERY ==========
+    # Create a sample of pages for structure analysis (first 3, middle 2, last 3)
+    sample_pages = []
     
-    # Step 2: Group pages by type
-    cif_pages = [p for p in pages_data if p['type'] == 'CIF']
-    resume_pages = [p for p in pages_data if p['type'] == 'Resume']
-    exp_letter_pages = [p for p in pages_data if p['type'] == 'Experience Letter']
+    # First 3 pages
+    sample_pages.extend(pages_data[:3])
     
-    # Step 3: Extract personal info from first few pages
+    # Middle 2 pages
+    mid_point = total_pages // 2
+    if total_pages > 6:
+        sample_pages.extend(pages_data[mid_point:mid_point+2])
+    
+    # Last 3 pages
+    if total_pages > 3:
+        sample_pages.extend(pages_data[-3:])
+    
+    # Build sample text with page numbers
+    sample_text = ""
+    for p in sample_pages:
+        sample_text += f"\n{'='*60}\nPAGE {p['page_num']} of {total_pages}\n{'='*60}\n"
+        sample_text += p['text'][:1000]  # First 1000 chars of each sample page
+    
+    # AI: Analyze structure and identify page ranges
+    structure_prompt = f"""Analyze this {total_pages}-page merged candidate document and identify which pages contain each section.
+
+SAMPLE PAGES (showing snippets from beginning, middle, and end):
+{sample_text}
+
+TASK: Identify page ranges for each section type:
+1. CIF (Candidate Information Form) - look for "Professional Information", "Present Employer"
+2. Resume/CV - look for "Experience", "Skills", "Summary", formatted CV layout
+3. Experience Letters - look for "EXPERIENCE CERTIFICATE", company letterheads, "worked as"
+
+Return ONLY valid JSON:
+{{
+  "cif_pages": [1, 2, 3],
+  "resume_pages": [4, 5, 6, 7, 8, 9, 10],
+  "experience_letter_pages": [25, 26, 27]
+}}
+
+Rules:
+- Return empty array [] if section not found
+- Estimate page ranges based on patterns you see
+- CIF is usually first 1-3 pages
+- Resume is usually middle pages  
+- Experience letters are usually last pages
+- If uncertain, include the pages"""
+
+    try:
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": structure_prompt}],
+            temperature=0.05,
+            max_tokens=500
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        if start != -1 and end > start:
+            structure = json.loads(response_text[start:end])
+        else:
+            # Fallback: assume standard structure
+            structure = {
+                "cif_pages": list(range(1, min(4, total_pages+1))),
+                "resume_pages": list(range(4, total_pages-2)) if total_pages > 6 else [],
+                "experience_letter_pages": list(range(max(1, total_pages-2), total_pages+1))
+            }
+    except:
+        # Fallback structure if AI fails
+        structure = {
+            "cif_pages": list(range(1, min(4, total_pages+1))),
+            "resume_pages": list(range(4, total_pages-2)) if total_pages > 6 else [],
+            "experience_letter_pages": list(range(max(1, total_pages-2), total_pages+1))
+        }
+    
+    # ========== PASS 2: TARGETED DEEP EXTRACTION ==========
+    
+    # Extract personal info from first few pages
     personal_info = {}
     first_pages_text = '\n\n'.join([p['text'] for p in pages_data[:3]])
     
     try:
-        personal_prompt = f"""Extract personal information from this document:
+        personal_prompt = f"""Extract personal information:
 
-{first_pages_text[:3000]}
+{first_pages_text[:5000]}
 
 Return ONLY valid JSON:
 {{
   "full_name": "Extract candidate name",
   "cnic": "Extract CNIC (format: 00000-0000000-0)",
-  "email": "Extract email address",
-  "contact": "Extract phone number"
+  "email": "Extract email",
+  "contact": "Extract phone"
 }}"""
 
         response = client.chat.completions.create(
@@ -528,16 +604,23 @@ Return ONLY valid JSON:
     except:
         personal_info = {"full_name": "Unknown", "cnic": "", "email": "", "contact": ""}
     
-    # Step 4: Extract experience from CIF pages
+    # Initialize results
     cif_experience = {"found": False, "details": ""}
+    resume_experience = {"found": False, "details": ""}
+    exp_letter_found = {"found": False, "details": ""}
     all_experiences = []
     
-    if cif_pages:
-        cif_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in cif_pages])
+    # Extract CIF experience (FULL TEXT of identified CIF pages)
+    if structure.get("cif_pages"):
+        cif_page_nums = structure["cif_pages"]
+        cif_pages_filtered = [p for p in pages_data if p['page_num'] in cif_page_nums]
         
-        cif_prompt = f"""Extract work experience from this CIF Professional Information section:
+        if cif_pages_filtered:
+            cif_full_text = '\n\n'.join([f"PAGE {p['page_num']}:\n{p['text']}" for p in cif_pages_filtered])
+            
+            cif_prompt = f"""Extract work experience from CIF Professional Information section:
 
-{cif_text[:5000]}
+{cif_full_text}
 
 Return ONLY valid JSON:
 {{
@@ -549,46 +632,47 @@ Return ONLY valid JSON:
       "designation": "Job title",
       "date_joining": "DD/MM/YYYY",
       "date_leaving": "DD/MM/YYYY or Present",
-      "duration_months": "Calculate months",
-      "monthly_salary": "Extract if mentioned",
+      "duration_months": "Number",
+      "monthly_salary": "Amount if mentioned",
       "responsibilities": "Brief summary"
     }}
   ]
 }}
 
-found = true only if actual work experience exists (not empty fields)."""
+found = true ONLY if actual work experience exists (not empty fields)."""
 
-        try:
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": cif_prompt}],
-                temperature=0.05,
-                max_tokens=2000
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
-            if start != -1 and end > start:
-                cif_data = json.loads(response_text[start:end])
-                cif_experience = {"found": cif_data.get("found", False), "details": cif_data.get("details", "")}
+            try:
+                response = client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": cif_prompt}],
+                    temperature=0.05,
+                    max_tokens=3000
+                )
                 
-                # Add to all_experiences with source
-                for exp in cif_data.get("experiences", []):
-                    exp['source'] = 'CIF'
-                    all_experiences.append(exp)
-        except:
-            pass
+                response_text = response.choices[0].message.content.strip()
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                if start != -1 and end > start:
+                    cif_data = json.loads(response_text[start:end])
+                    cif_experience = {"found": cif_data.get("found", False), "details": cif_data.get("details", "")}
+                    
+                    for exp in cif_data.get("experiences", []):
+                        exp['source'] = 'CIF'
+                        all_experiences.append(exp)
+            except:
+                pass
     
-    # Step 5: Extract experience from Resume pages
-    resume_experience = {"found": False, "details": ""}
-    
-    if resume_pages:
-        resume_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in resume_pages])
+    # Extract Resume experience (FULL TEXT of identified Resume pages)
+    if structure.get("resume_pages"):
+        resume_page_nums = structure["resume_pages"]
+        resume_pages_filtered = [p for p in pages_data if p['page_num'] in resume_page_nums]
         
-        resume_prompt = f"""Extract work experience from this Resume/CV:
+        if resume_pages_filtered:
+            resume_full_text = '\n\n'.join([f"PAGE {p['page_num']}:\n{p['text']}" for p in resume_pages_filtered])
+            
+            resume_prompt = f"""Extract ALL work experience from this Resume/CV:
 
-{resume_text[:8000]}
+{resume_full_text}
 
 Return ONLY valid JSON:
 {{
@@ -600,46 +684,47 @@ Return ONLY valid JSON:
       "designation": "Job title",
       "date_joining": "DD/MM/YYYY",
       "date_leaving": "DD/MM/YYYY or Present",
-      "duration_months": "Calculate months",
-      "monthly_salary": "Extract if mentioned",
+      "duration_months": "Number",
+      "monthly_salary": "Amount if mentioned",
       "responsibilities": "Brief summary"
     }}
   ]
 }}
 
-found = true only if actual work experience exists."""
+found = true if work experience exists in resume."""
 
-        try:
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": resume_prompt}],
-                temperature=0.05,
-                max_tokens=3000
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
-            if start != -1 and end > start:
-                resume_data = json.loads(response_text[start:end])
-                resume_experience = {"found": resume_data.get("found", False), "details": resume_data.get("details", "")}
+            try:
+                response = client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": resume_prompt}],
+                    temperature=0.05,
+                    max_tokens=4000
+                )
                 
-                # Add to all_experiences with source
-                for exp in resume_data.get("experiences", []):
-                    exp['source'] = 'Resume'
-                    all_experiences.append(exp)
-        except:
-            pass
+                response_text = response.choices[0].message.content.strip()
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                if start != -1 and end > start:
+                    resume_data = json.loads(response_text[start:end])
+                    resume_experience = {"found": resume_data.get("found", False), "details": resume_data.get("details", "")}
+                    
+                    for exp in resume_data.get("experiences", []):
+                        exp['source'] = 'Resume'
+                        all_experiences.append(exp)
+            except:
+                pass
     
-    # Step 6: Extract experience from Experience Letter pages
-    exp_letter_found = {"found": False, "details": ""}
-    
-    if exp_letter_pages:
-        exp_letter_text = '\n\n'.join([f"PAGE {p['page_num']}: {p['text']}" for p in exp_letter_pages])
+    # Extract Experience Letters (FULL TEXT of identified Letter pages)
+    if structure.get("experience_letter_pages"):
+        letter_page_nums = structure["experience_letter_pages"]
+        letter_pages_filtered = [p for p in pages_data if p['page_num'] in letter_page_nums]
         
-        exp_letter_prompt = f"""Extract work experience from these Experience Certificates/Letters:
+        if letter_pages_filtered:
+            letter_full_text = '\n\n'.join([f"PAGE {p['page_num']}:\n{p['text']}" for p in letter_pages_filtered])
+            
+            letter_prompt = f"""Extract work experience from these Experience Certificates/Letters:
 
-{exp_letter_text[:8000]}
+{letter_full_text}
 
 Return ONLY valid JSON:
 {{
@@ -648,47 +733,48 @@ Return ONLY valid JSON:
   "experiences": [
     {{
       "employer": "Company name from letterhead",
-      "designation": "Job title mentioned",
+      "designation": "Job title",
       "date_joining": "DD/MM/YYYY",
       "date_leaving": "DD/MM/YYYY",
-      "duration_months": "Calculate months",
-      "monthly_salary": "Extract if mentioned",
-      "responsibilities": "Brief description from letter"
+      "duration_months": "Number",
+      "monthly_salary": "Amount if mentioned",
+      "responsibilities": "Brief from letter"
     }}
   ]
 }}
 
 found = true if experience certificate/letter exists."""
 
-        try:
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": exp_letter_prompt}],
-                temperature=0.05,
-                max_tokens=3000
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
-            if start != -1 and end > start:
-                exp_letter_data = json.loads(response_text[start:end])
-                exp_letter_found = {"found": exp_letter_data.get("found", False), "details": exp_letter_data.get("details", "")}
+            try:
+                response = client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": letter_prompt}],
+                    temperature=0.05,
+                    max_tokens=4000
+                )
                 
-                # Add to all_experiences with source
-                for exp in exp_letter_data.get("experiences", []):
-                    exp['source'] = 'Experience Letter'
-                    all_experiences.append(exp)
-        except:
-            pass
+                response_text = response.choices[0].message.content.strip()
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                if start != -1 and end > start:
+                    letter_data = json.loads(response_text[start:end])
+                    exp_letter_found = {"found": letter_data.get("found", False), "details": letter_data.get("details", "")}
+                    
+                    for exp in letter_data.get("experiences", []):
+                        exp['source'] = 'Experience Letter'
+                        all_experiences.append(exp)
+            except:
+                pass
     
-    # Step 7: Return merged results
+    # Return merged results
     return {
         "personal_info": personal_info,
         "experience_in_cif": cif_experience,
         "experience_in_resume": resume_experience,
         "experience_letter_found": exp_letter_found,
-        "all_experiences": all_experiences
+        "all_experiences": all_experiences,
+        "ocr_used_pages": ocr_used_pages,
+        "structure": structure
     }
 
 
@@ -892,7 +978,7 @@ def main():
     )
     
     # Custom CSS for better styling
-    st.markdown("""
+    st.markdown('''
         <style>
         .main-header {
             font-size: 2.5rem;
@@ -920,7 +1006,7 @@ def main():
             border: 1px solid #F44336;
         }
         </style>
-    """, unsafe_allow_html=True)
+    ''', unsafe_allow_html=True)
     
     # Sidebar configuration
     with st.sidebar:
@@ -964,8 +1050,8 @@ def main():
         st.markdown("""
         - Matriculation / SSC
         - Intermediate / HSSC / FSc / FA
-        - Bachelor's Degrees
-        - Master's Degrees
+        - Bachelor Degrees
+        - Master Degrees
         - Diplomas (DAE)
         """)
     
