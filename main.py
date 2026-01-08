@@ -15,6 +15,7 @@ from config import APP_TITLE, APP_ICON, APP_LAYOUT
 from pages.document_parser import document_parser_page
 from pages.spreadsheet_loader import spreadsheet_loader_page
 from pages.experience_parser import experience_parser_page
+from pages.school_standardizer import school_name_standardizer_page
 from pages.settings import settings_page
 
 
@@ -63,7 +64,7 @@ def main():
         # Navigation
         page = st.radio(
             "Select Page",
-            ["📄 Document Parser", "📊 Spreadsheet Loader", "👔 Experience Parser", "⚙️ Settings"],
+            ["📄 Document Parser", "📊 Spreadsheet Loader", "🏫 School Standardizer", "👔 Experience Parser", "⚙️ Settings"],
             label_visibility="collapsed"
         )
         
@@ -107,6 +108,8 @@ def main():
         document_parser_page(person_number)
     elif page == "📊 Spreadsheet Loader":
         spreadsheet_loader_page()
+    elif page == "🏫 School Standardizer":
+        school_name_standardizer_page()
     elif page == "👔 Experience Parser":
         experience_parser_page()
     elif page == "⚙️ Settings":
